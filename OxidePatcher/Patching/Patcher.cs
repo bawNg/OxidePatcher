@@ -1,8 +1,8 @@
 ﻿using System;
 using System.IO;
 using System.Linq;
-
 using Mono.Cecil;
+using Mono.Cecil.Cil;
 
 namespace OxidePatcher.Patching
 {
@@ -131,6 +131,15 @@ namespace OxidePatcher.Patching
 
                 var baseHooks = (from hook in manifest.Hooks where hook.BaseHook != null select hook.BaseHook).ToList();
 
+                var enum_type = new TypeDefinition("Oxide", "GameHooks", TypeAttributes.Public | TypeAttributes.Sealed);
+                enum_type.BaseType = assembly.MainModule.Import(typeof(Enum));
+                assembly.MainModule.Types.Add(enum_type);
+
+                var field = new FieldDefinition("value__", FieldAttributes.Public | FieldAttributes.SpecialName | FieldAttributes.RTSpecialName, assembly.MainModule.TypeSystem.Int32);
+                enum_type.Fields.Add(field);
+
+                var hook_count = 0;
+
                 // Loop each hook
                 foreach (var hook in manifest.Hooks)
                 {
@@ -170,6 +179,12 @@ namespace OxidePatcher.Patching
                             {
                                 Log("Applied hook {0} to {1}::{2}", hook.Name, hook.TypeName, hook.Signature.Name);
                                 weaver.Apply(method.Body);
+                                if (enum_type.Fields.All(f => f.Name != hook.HookName))
+                                {
+                                    field = new FieldDefinition(hook.HookName, FieldAttributes.Public | FieldAttributes.Static | FieldAttributes.Literal | FieldAttributes.HasDefault, enum_type);
+                                    field.Constant = hook_count++;
+                                    enum_type.Fields.Add(field);
+                                }
                             }
                             else
                             {
@@ -185,6 +200,10 @@ namespace OxidePatcher.Patching
                         }
                     }
                 }
+
+                field = new FieldDefinition("Count", FieldAttributes.Public | FieldAttributes.Static | FieldAttributes.Literal | FieldAttributes.HasDefault, enum_type);
+                field.Constant = hook_count;
+                enum_type.Fields.Add(field);
 
                 // Save it
                 Log("Saving assembly {0}", manifest.AssemblyName);

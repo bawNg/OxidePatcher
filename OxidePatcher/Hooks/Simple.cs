@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Windows.Forms;
-
 using OxidePatcher.Patching;
 using OxidePatcher.Views;
 
@@ -51,11 +49,6 @@ namespace OxidePatcher.Hooks
 
         public override bool ApplyPatch(MethodDefinition original, ILWeaver weaver, AssemblyDefinition oxideassembly, Patcher patcher = null)
         {
-            // Get the call hook method
-            MethodDefinition callhookmethod = oxideassembly.MainModule.Types
-                .Single((t) => t.FullName == "Oxide.Core.Interface")
-                .Methods.Single((m) => m.IsStatic && m.Name == "CallHook");
-
             // Start injecting where requested
             weaver.Pointer = InjectionIndex;
 
@@ -70,22 +63,35 @@ namespace OxidePatcher.Hooks
                 ShowMsg(string.Format("The injection index specified for {0} is invalid!", Name), "Invalid Index", patcher);
                 return false;
             }
+            
+            var dispatch_method = BuildDispatchMethod(patcher, weaver, oxideassembly, original.Module, original.DeclaringType, original, HookName);
 
-            // Load the hook name
+            Instruction first_injected;
+            if (ReturnBehavior == ReturnBehavior.ModifyRefArg)
+            {
+                var callhook = oxideassembly.MainModule.GetType("Oxide.Core.Interface").Methods.Single(m => m.IsStatic && m.Name == "CallHook");
 
-            // Push the arguments array to the stack and make the call
-            VariableDefinition argsvar;
-            var firstinjected = PushArgsArray(original, weaver, out argsvar, patcher);
-            var hookname = weaver.Add(Instruction.Create(OpCodes.Ldstr, HookName));
-            if (firstinjected == null) firstinjected = hookname;
-            if (argsvar != null)
-                weaver.Ldloc(argsvar);
+                // Push the arguments array to the stack and make the call
+                VariableDefinition argsvar;
+                first_injected = PushArgsArray(original, weaver, out argsvar, patcher);
+                var hookname = weaver.Add(Instruction.Create(OpCodes.Ldstr, HookName));
+                if (first_injected == null) first_injected = hookname;
+                if (argsvar != null)
+                    weaver.Ldloc(argsvar);
+                else
+                    weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                weaver.Add(Instruction.Create(OpCodes.Call, original.Module.Import(callhook)));
+
+                DealWithReturnValue(oxideassembly, original, argsvar, weaver);
+            }
             else
-                weaver.Add(Instruction.Create(OpCodes.Ldnull));
-            weaver.Add(Instruction.Create(OpCodes.Call, original.Module.Import(callhookmethod)));
+            {
+                VariableDefinition ret_var;
+                ret_var = LoadDispatchArgs(original, weaver, patcher, out first_injected);
+                weaver.Add(Instruction.Create(OpCodes.Call, dispatch_method));
 
-            // Deal with the return value
-            DealWithReturnValue(original, argsvar, weaver);
+                DealWithReturnValue(oxideassembly, original, null, weaver, ret_var);
+            }
 
             // Find all instructions which pointed to the existing and redirect them
             for (int i = 0; i < weaver.Instructions.Count; i++)
@@ -96,16 +102,199 @@ namespace OxidePatcher.Hooks
                     // Check if the instruction lies within our injection range
                     // If it does, it's an instruction we just injected so we don't want to edit it
                     if (i < InjectionIndex || i > weaver.Pointer)
-                        ins.Operand = firstinjected;
+                        ins.Operand = first_injected;
                 }
             }
             return true;
         }
 
+        private MethodDefinition BuildDispatchMethod(Patcher patcher, ILWeaver weaver, AssemblyDefinition oxideassembly, ModuleDefinition module, TypeDefinition type, MethodDefinition method, string name)
+        {
+            var parameter_types = new List<TypeReference>();
+
+            var object_type = module.Import(typeof(object));
+            var bool_type = module.Import(typeof(bool));
+
+            // Are we going to use arguments?
+            if (ArgumentBehavior != ArgumentBehavior.None)
+            {
+                // Are we using the argument string?
+                if (ArgumentBehavior == ArgumentBehavior.UseArgumentString)
+                {
+                    string retvalue;
+                    var args = ParseArgumentString(out retvalue);
+                    if (args != null)
+                    {
+                        for (int i = 0; i < args.Length; i++)
+                        {
+                            string arg = args[i];
+                            if (string.IsNullOrEmpty(arg))
+                            {
+                                parameter_types.Add(object_type);
+                                continue;
+                            }
+
+                            var tokens = new string[0];
+                            if (arg.Contains("."))
+                            {
+                                var parts = arg.Split('.');
+                                arg = parts[0];
+                                tokens = parts.Skip(1).ToArray();
+                            }
+
+                            var parameter_type = object_type;
+                            if (arg == "this")
+                            {
+                                if (!method.IsStatic) parameter_type = type;
+                            }
+                            else if (arg[0] == 'p' || arg[0] == 'a')
+                            {
+                                int index;
+                                if (int.TryParse(arg.Substring(1), out index))
+                                    parameter_type = method.Parameters[index].ParameterType;
+                            }
+                            else if (arg[0] == 'l' || arg[0] == 'v')
+                            {
+                                int index;
+                                if (int.TryParse(arg.Substring(1), out index))
+                                    parameter_type = weaver.Variables[index].VariableType;
+                            }
+
+                            if (tokens.Length > 0)
+                            {
+                                parameter_type = GetFieldOrProperty(null, method, parameter_type.Resolve(), tokens, patcher);
+                                if (parameter_type == null)
+                                {
+                                    //TODO: Show error?
+                                    parameter_type = object_type;
+                                }
+                            }
+                            
+                            parameter_types.Add(parameter_type);
+                        }
+                    }
+                }
+                else
+                {
+                    // Figure out what we're doing
+                    bool includeargs = ArgumentBehavior == ArgumentBehavior.All || ArgumentBehavior == ArgumentBehavior.JustParams;
+                    bool includethis = ArgumentBehavior == ArgumentBehavior.All || ArgumentBehavior == ArgumentBehavior.JustThis;
+
+                    if (includethis && !method.IsStatic) parameter_types.Add(type);
+
+                    if (includeargs)
+                    {
+                        for (int i = 0; i < method.Parameters.Count; i++)
+                        {
+                            var parameter = method.Parameters[i];
+                            if (!parameter.IsOut) parameter_types.Add(parameter.ParameterType);
+                        }
+                    }
+                }
+            }
+            
+            var attributes = MethodAttributes.CompilerControlled | MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig;
+            var new_method = new MethodDefinition("Dispatch_" + name, attributes, module.Import(bool_type)) { DeclaringType = type };
+
+            ParameterDefinition ret_parameter = null;
+            if (method.ReturnType.MetadataType != MetadataType.Void)
+            {
+                var ret_type = new ByReferenceType(module.Import(method.ReturnType));
+                ret_parameter = new ParameterDefinition(ret_type) { Name = "return_value", IsOut = true };
+                new_method.Parameters.Add(ret_parameter);
+            }
+
+            foreach (var parameter_type in parameter_types)
+            {
+                new_method.Parameters.Add(new ParameterDefinition(parameter_type.Name.ToLower(), ParameterAttributes.None, module.Import(parameter_type)));
+            }
+            
+            new_method.ImplAttributes = MethodImplAttributes.Managed;
+            
+            var body = new MethodBody(new_method);
+            weaver = new ILWeaver(body) { Module = module };
+            
+            if (parameter_types.Count > 0)
+            {
+                var argsvar = weaver.AddVariable(new ArrayType(method.Module.TypeSystem.Object), "args");
+                weaver.Add(ILWeaver.Ldc_I4_n(parameter_types.Count));
+                weaver.Add(Instruction.Create(OpCodes.Newarr, method.Module.TypeSystem.Object));
+                weaver.Stloc(argsvar);
+
+                for (var i = 1; i < new_method.Parameters.Count; i++)
+                {
+                    var parameter = new_method.Parameters[i];
+                    weaver.Ldloc(argsvar);
+                    weaver.Add(ILWeaver.Ldc_I4_n(i - 1));
+                    weaver.Add(ILWeaver.Ldarg(parameter));
+
+                    if (parameter.ParameterType.IsByReference)
+                    {
+                        weaver.Add(Instruction.Create(OpCodes.Ldobj, parameter.ParameterType));
+                        weaver.Add(Instruction.Create(OpCodes.Box, parameter.ParameterType));
+                    }
+                    else if (parameter.ParameterType.IsValueType)
+                    {
+                        weaver.Add(Instruction.Create(OpCodes.Box, parameter.ParameterType));
+                    }
+
+                    weaver.Add(Instruction.Create(OpCodes.Stelem_Ref));
+                }
+
+                weaver.Add(Instruction.Create(OpCodes.Ldstr, HookName));
+                weaver.Ldloc(argsvar);
+            }
+            else
+            {
+                weaver.Add(Instruction.Create(OpCodes.Ldnull));
+            }
+
+            var callhook = oxideassembly.MainModule.GetType("Oxide.Core.Interface").Methods.Single(m => m.Name == "CallHook");
+            weaver.Add(Instruction.Create(OpCodes.Call, module.Import(callhook)));
+
+            if (ret_parameter != null)
+            {
+                var result = weaver.AddVariable(module.Import(module.TypeSystem.Object), "result");
+                weaver.Stloc(result);
+
+                weaver.Ldloc(result);
+
+                // Check if the CallHook return is not null and matches the return type
+                weaver.Add(Instruction.Create(OpCodes.Isinst, method.ReturnType));
+                var i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                var skip_ret_handling = weaver.Add(Instruction.Create(OpCodes.Beq_S, i));
+
+                // Unbox return and set it to the ret out parameter
+                weaver.Ldloc(result);
+                weaver.Add(Instruction.Create(OpCodes.Unbox_Any, method.ReturnType));
+                weaver.Starg(ret_parameter);
+
+                // Return true
+                weaver.Add(Instruction.Create(OpCodes.Ldc_I4_1));
+                weaver.Add(Instruction.Create(OpCodes.Ret));
+
+                skip_ret_handling.Operand = weaver.Add(Instruction.Create(OpCodes.Ldc_I4_0));
+            }
+            else
+            {
+                weaver.Add(Instruction.Create(OpCodes.Ldc_I4_0));
+            }
+            
+            weaver.Add(Instruction.Create(OpCodes.Ret));
+
+            weaver.Apply(body);
+
+            //body.SimplifyMacros(); //TODO: Add Cecil.Rocks if this is needed
+            new_method.Body = body;
+            type.Methods.Add(new_method);
+
+            return new_method;
+        }
+        
         private Instruction PushArgsArray(MethodDefinition method, ILWeaver weaver, out VariableDefinition argsvar, Patcher patcher)
         {
             // Are we going to use arguments?
-            if (ArgumentBehavior == Hooks.ArgumentBehavior.None)
+            if (ArgumentBehavior == ArgumentBehavior.None)
             {
                 // Push null and we're done
                 argsvar = null;
@@ -115,7 +304,7 @@ namespace OxidePatcher.Hooks
             // Create array variable
             Instruction firstInstruction;
             // Are we using the argument string?
-            if (ArgumentBehavior == Hooks.ArgumentBehavior.UseArgumentString)
+            if (ArgumentBehavior == ArgumentBehavior.UseArgumentString)
             {
                 string retvalue;
                 string[] args = ParseArgumentString(out retvalue);
@@ -133,21 +322,17 @@ namespace OxidePatcher.Hooks
                 weaver.Stloc(argsvar);
 
                 // Populate it
-                for (int i = 0; i < args.Length; i++)
+                for (var i = 0; i < args.Length; i++)
                 {
-                    string arg = args[i].ToLowerInvariant();
-                    string[] target = null;
-                    if (!string.IsNullOrEmpty(arg) && args[i].Contains("."))
-                    {
-                        string[] split = args[i].Split('.');
-                        arg = split[0];
-                        target = split.Skip(1).ToArray();
-                    }
+                    var arg = args[i];
+                    var target = ParseTargetString(ref arg);
 
                     weaver.Ldloc(argsvar);
                     weaver.Add(ILWeaver.Ldc_I4_n(i));
                     if (string.IsNullOrEmpty(arg))
+                    {
                         weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                    }
                     else if (arg == "this")
                     {
                         if (method.IsStatic)
@@ -177,7 +362,7 @@ namespace OxidePatcher.Hooks
                                 weaver.Add(Instruction.Create(OpCodes.Box, pdef.ParameterType));
                             }
 
-                            if (!GetFieldOrProperty(weaver, method, pdef.ParameterType.Resolve(), target, patcher) && pdef.ParameterType.IsValueType)
+                            if (GetFieldOrProperty(weaver, method, pdef.ParameterType.Resolve(), target, patcher) == null && pdef.ParameterType.IsValueType)
                                 weaver.Add(Instruction.Create(OpCodes.Box, pdef.ParameterType));
                         }
                         else
@@ -197,14 +382,16 @@ namespace OxidePatcher.Hooks
                                 weaver.Add(Instruction.Create(OpCodes.Box, vdef.VariableType));
                             }
 
-                            if (!GetFieldOrProperty(weaver, method, vdef.VariableType.Resolve(), target, patcher) && vdef.VariableType.IsValueType)
+                            if (GetFieldOrProperty(weaver, method, vdef.VariableType.Resolve(), target, patcher) == null && vdef.VariableType.IsValueType)
                                 weaver.Add(Instruction.Create(OpCodes.Box, vdef.VariableType));
                         }
                         else
                             weaver.Add(Instruction.Create(OpCodes.Ldnull));
                     }
                     else
+                    {
                         weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                    }
 
                     weaver.Add(Instruction.Create(OpCodes.Stelem_Ref));
                 }
@@ -212,8 +399,8 @@ namespace OxidePatcher.Hooks
             else
             {
                 // Figure out what we're doing
-                bool includeargs = ArgumentBehavior == Hooks.ArgumentBehavior.All || ArgumentBehavior == Hooks.ArgumentBehavior.JustParams;
-                bool includethis = ArgumentBehavior == Hooks.ArgumentBehavior.All || ArgumentBehavior == Hooks.ArgumentBehavior.JustThis;
+                bool includeargs = ArgumentBehavior == ArgumentBehavior.All || ArgumentBehavior == ArgumentBehavior.JustParams;
+                bool includethis = ArgumentBehavior == ArgumentBehavior.All || ArgumentBehavior == ArgumentBehavior.JustThis;
                 if (method.IsStatic) includethis = false;
 
                 // Work out what arguments we're going to transmit
@@ -271,16 +458,163 @@ namespace OxidePatcher.Hooks
             return firstInstruction;
         }
 
-        private void DealWithReturnValue(MethodDefinition method, VariableDefinition argsvar, ILWeaver weaver)
+        private VariableDefinition LoadDispatchArgs(MethodDefinition method, ILWeaver weaver, Patcher patcher, out Instruction first_instruction)
+        {
+            // Are we going to use arguments?
+            if (ArgumentBehavior == ArgumentBehavior.None)
+            {
+                first_instruction = null;
+                return null;
+            }
+
+            VariableDefinition ret_var = null;
+
+            // Are we using the argument string?
+            if (ArgumentBehavior == ArgumentBehavior.UseArgumentString)
+            {
+                string retvalue;
+                string[] args = ParseArgumentString(out retvalue);
+                if (args == null)
+                {
+                    // Silently fail, but at least produce valid IL
+                    first_instruction = null;
+                    return null;
+                }
+
+                ret_var = weaver.AddVariable(method.Module.Import(method.ReturnType), "return_value");
+
+                // Load the ret local variable by reference onto the stack first
+                first_instruction = weaver.Ldloc(ret_var);
+                weaver.Add(Instruction.Create(OpCodes.Ldobj, ret_var.VariableType));
+
+                // Load all arguments on the stack
+                for (int i = 0; i < args.Length; i++)
+                {
+                    var arg = args[i];
+                    var target = ParseTargetString(ref arg);
+
+                    if (string.IsNullOrEmpty(arg))
+                    {
+                        weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                    }
+                    else if (arg == "this")
+                    {
+                        if (method.IsStatic)
+                            weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                        else
+                            weaver.Add(ILWeaver.Ldarg(null));
+
+                        GetFieldOrProperty(weaver, method, method.DeclaringType.Resolve(), target, patcher);
+                    }
+                    else if (arg[0] == 'p' || arg[0] == 'a')
+                    {
+                        int index;
+                        if (int.TryParse(arg.Substring(1), out index))
+                        {
+                            ParameterDefinition pdef;
+
+                            /*if (method.IsStatic)
+                                pdef = method.Parameters[index];
+                            else
+                                pdef = method.Parameters[index + 1];*/
+                            pdef = method.Parameters[index];
+
+                            weaver.Add(ILWeaver.Ldarg(pdef));
+                            if (pdef.ParameterType.IsByReference)
+                            {
+                                weaver.Add(Instruction.Create(OpCodes.Ldobj, pdef.ParameterType));
+                                //weaver.Add(Instruction.Create(OpCodes.Box, pdef.ParameterType));
+                            }
+
+                            GetFieldOrProperty(weaver, method, pdef.ParameterType.Resolve(), target, patcher);
+                        }
+                        else
+                        {
+                            weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                        }
+                    }
+                    else if (arg[0] == 'l' || arg[0] == 'v')
+                    {
+                        int index;
+                        if (int.TryParse(arg.Substring(1), out index))
+                        {
+                            VariableDefinition vdef = weaver.Variables[index];
+                            weaver.Ldloc(vdef);
+                            
+                            if (vdef.VariableType.IsByReference)
+                            {
+                                weaver.Add(Instruction.Create(OpCodes.Ldobj, vdef.VariableType));
+                                //weaver.Add(Instruction.Create(OpCodes.Box, vdef.VariableType));
+                            }
+
+                            GetFieldOrProperty(weaver, method, vdef.VariableType.Resolve(), target, patcher);
+                        }
+                        else
+                        {
+                            weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                        }
+                    }
+                    else
+                    {
+                        weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                    }
+                }
+            }
+            else
+            {
+                ret_var = weaver.AddVariable(method.Module.Import(method.ReturnType), "return_value");
+
+                // Load the ret local variable by reference onto the stack first
+                first_instruction = weaver.Ldloc(ret_var);
+                weaver.Add(Instruction.Create(OpCodes.Ldobj, ret_var.VariableType));
+
+                // Figure out what we're doing
+                var has_params = ArgumentBehavior == ArgumentBehavior.All || ArgumentBehavior == ArgumentBehavior.JustParams;
+                var has_this = ArgumentBehavior == ArgumentBehavior.All || ArgumentBehavior == ArgumentBehavior.JustThis;
+                if (method.IsStatic) has_this = false;
+
+                // Work out what arguments we're going to include
+                var parameters = new List<ParameterDefinition>();
+                if (has_params)
+                {
+                    for (int i = 0; i < method.Parameters.Count; i++)
+                    {
+                        var parameter = method.Parameters[i];
+                        if (!parameter.IsOut) parameters.Add(parameter);
+                    }
+                }
+                
+                if (has_this)
+                {
+                    first_instruction = weaver.Add(ILWeaver.Ldarg(null));
+                }
+                
+                foreach (var arg in parameters)
+                {
+                    var instruction = weaver.Add(ILWeaver.Ldarg(arg));
+                    if (first_instruction == null) first_instruction = instruction;
+                    if (arg.ParameterType.IsByReference)
+                    {
+                        weaver.Add(Instruction.Create(OpCodes.Ldobj, arg.ParameterType));
+                        //if (arg.ParameterType.Full?Name == "System.Object") weaver.Add(Instruction.Create(OpCodes.Box, arg.ParameterType));
+                    }
+                }
+            }
+
+            return ret_var;
+        }
+
+
+        private void DealWithReturnValue(AssemblyDefinition oxideassembly, MethodDefinition method, VariableDefinition argsvar, ILWeaver weaver, VariableDefinition ret_var = null)
         {
             // What return behavior do we use?
             switch (ReturnBehavior)
             {
-                case Hooks.ReturnBehavior.Continue:
+                case ReturnBehavior.Continue:
                     // Just discard the return value
                     weaver.Add(Instruction.Create(OpCodes.Pop));
                     break;
-                case Hooks.ReturnBehavior.ExitWhenValidType:
+                case ReturnBehavior.ExitWhenValidType:
                     // Is there a return value or not?
                     if (method.ReturnType.FullName == "System.Void")
                     {
@@ -291,29 +625,40 @@ namespace OxidePatcher.Hooks
                     }
                     else
                     {
-                        // Create variable
-                        VariableDefinition returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
+                        if (ret_var == null)
+                        {
+                            // Create variable
+                            VariableDefinition returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
 
-                        // Store the return value in it
-                        weaver.Stloc(returnvar);
-                        weaver.Ldloc(returnvar);
+                            // Store the return value in it
+                            weaver.Stloc(returnvar);
+                            
+                            weaver.Ldloc(returnvar);
 
-                        // If it's non-null and matches the return type, return it - else continue
-                        weaver.Add(Instruction.Create(OpCodes.Isinst, method.ReturnType));
-                        Instruction i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
-                        weaver.Add(Instruction.Create(OpCodes.Beq_S, i.Next));
-                        weaver.Ldloc(returnvar);
-                        weaver.Add(Instruction.Create(OpCodes.Unbox_Any, method.ReturnType));
-                        weaver.Add(Instruction.Create(OpCodes.Ret));
+                            // If it's non-null and matches the return type, return it - else continue
+                            weaver.Add(Instruction.Create(OpCodes.Isinst, method.ReturnType));
+                            Instruction i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                            weaver.Add(Instruction.Create(OpCodes.Beq_S, i.Next));
+
+                            weaver.Ldloc(returnvar);
+                            weaver.Add(Instruction.Create(OpCodes.Unbox_Any, method.ReturnType));
+                            weaver.Add(Instruction.Create(OpCodes.Ret));
+                        }
+                        else
+                        {
+                            var jump_to_end = weaver.Add(Instruction.Create(OpCodes.Brfalse, weaver.Instructions[0]));
+                            weaver.Ldloc(ret_var);
+                            weaver.Add(Instruction.Create(OpCodes.Ret));
+                            jump_to_end.Operand = weaver.Add(Instruction.Create(OpCodes.Ldnull)); //TODO: support value types
+                            weaver.Add(Instruction.Create(OpCodes.Ret));
+                        }
                     }
                     break;
-                case Hooks.ReturnBehavior.ModifyRefArg:
+                case ReturnBehavior.ModifyRefArg:
+                    if (ret_var != null) throw new NotImplementedException("ReturnBehavior.ModifyRefArg not supported for fast dispatch methods");
                     string wayne;
                     var args = ParseArgumentString(out wayne);
-                    if (args == null)
-                    {
-                        break;
-                    }
+                    if (args == null) break;
                     for (int i = 0; i < args.Length; i++)
                     {
                         string arg = args[i].ToLowerInvariant();
@@ -352,7 +697,7 @@ namespace OxidePatcher.Hooks
                     }
                     weaver.Add(Instruction.Create(OpCodes.Pop));
                     break;
-                case Hooks.ReturnBehavior.UseArgumentString:
+                case ReturnBehavior.UseArgumentString:
                     // Deal with it according to the retvalue of the arg string
                     string retvalue;
                     ParseArgumentString(out retvalue);
@@ -363,21 +708,33 @@ namespace OxidePatcher.Hooks
                             int localindex;
                             if (int.TryParse(retvalue.Substring(1), out localindex))
                             {
-                                // Create variable and get the target variable
-                                VariableDefinition returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
-                                VariableDefinition targetvar = weaver.Variables[localindex];
+                                var targetvar = weaver.Variables[localindex];
 
-                                // Store the return value in it
-                                weaver.Stloc(returnvar);
-                                weaver.Ldloc(returnvar);
+                                if (ret_var == null)
+                                {
+                                    var returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
 
-                                // If it's non-null and matches the variable type, store it in the target variable
-                                weaver.Add(Instruction.Create(OpCodes.Isinst, targetvar.VariableType));
-                                Instruction i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
-                                weaver.Add(Instruction.Create(OpCodes.Beq_S, i.Next));
-                                weaver.Ldloc(returnvar);
-                                weaver.Add(Instruction.Create(OpCodes.Unbox_Any, targetvar.VariableType));
-                                weaver.Stloc(targetvar);
+                                    // Store the return value in it
+                                    weaver.Stloc(returnvar);
+                                    
+                                    weaver.Ldloc(returnvar);
+
+                                    // If it's non-null and matches the variable type, store it in the target variable
+                                    weaver.Add(Instruction.Create(OpCodes.Isinst, targetvar.VariableType));
+                                    Instruction i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                                    weaver.Add(Instruction.Create(OpCodes.Beq_S, i.Next));
+                                    weaver.Ldloc(returnvar);
+                                    weaver.Add(Instruction.Create(OpCodes.Unbox_Any, targetvar.VariableType));
+                                    weaver.Stloc(targetvar);
+                                }
+                                else
+                                {
+                                    var jump_to_end = weaver.Add(Instruction.Create(OpCodes.Brfalse, weaver.Instructions[0]));
+                                    weaver.Ldloc(targetvar);
+                                    weaver.Add(Instruction.Create(OpCodes.Ret));
+                                    jump_to_end.Operand = weaver.Add(Instruction.Create(OpCodes.Ldnull)); //TODO: support value types
+                                    weaver.Add(Instruction.Create(OpCodes.Ret));
+                                }
 
                                 // Handled
                                 return;
@@ -388,29 +745,43 @@ namespace OxidePatcher.Hooks
                             int localindex;
                             if (int.TryParse(retvalue.Substring(1), out localindex))
                             {
-                                // Create variable and get the target parameter
-                                VariableDefinition returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
-                                ParameterDefinition targetvar = method.Parameters[localindex];
-                                var byReferenceType = targetvar.ParameterType as ByReferenceType;
-                                TypeReference targettype = byReferenceType != null
-                                    ? byReferenceType.ElementType
-                                    : targetvar.ParameterType;
+                                var targetvar = method.Parameters[localindex];
 
-                                // Store the return value in it
-                                weaver.Stloc(returnvar);
-                                weaver.Ldloc(returnvar);
+                                if (ret_var == null)
+                                {
+                                    var returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
+                                    
+                                    var byReferenceType = targetvar.ParameterType as ByReferenceType;
+                                    TypeReference targettype = byReferenceType != null
+                                        ? byReferenceType.ElementType
+                                        : targetvar.ParameterType;
 
-                                // If it's non-null and matches the variable type, store it in the target parameter variable
-                                Instruction i = weaver.Add(Instruction.Create(OpCodes.Isinst, targettype));
-                                weaver.Add(Instruction.Create(OpCodes.Brfalse_S, i.Next));
-                                if (!targetvar.ParameterType.IsValueType)
-                                    weaver.Add(ILWeaver.Ldarg(targetvar));
-                                weaver.Ldloc(returnvar);
-                                weaver.Add(Instruction.Create(OpCodes.Unbox_Any, targettype));
-                                if (!targetvar.ParameterType.IsValueType)
-                                    weaver.Add(Instruction.Create(OpCodes.Stobj, targettype));
+                                    // Store the return value in it
+                                    weaver.Stloc(returnvar);
+                                    
+                                    weaver.Ldloc(returnvar);
+
+                                    // If it's non-null and matches the variable type, store it in the target parameter variable
+                                    weaver.Add(Instruction.Create(OpCodes.Isinst, targettype));
+                                    Instruction i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                                    weaver.Add(Instruction.Create(OpCodes.Brfalse_S, i.Next));
+                                    if (!targetvar.ParameterType.IsValueType)
+                                        weaver.Add(ILWeaver.Ldarg(targetvar));
+                                    weaver.Ldloc(returnvar);
+                                    weaver.Add(Instruction.Create(OpCodes.Unbox_Any, targettype));
+                                    if (!targetvar.ParameterType.IsValueType)
+                                        weaver.Add(Instruction.Create(OpCodes.Stobj, targettype));
+                                    else
+                                        weaver.Starg(targetvar);
+                                }
                                 else
-                                    weaver.Starg(targetvar);
+                                {
+                                    var jump_to_end = weaver.Add(Instruction.Create(OpCodes.Brfalse, weaver.Instructions[0]));
+                                    weaver.Add(ILWeaver.Ldarg(targetvar));
+                                    weaver.Add(Instruction.Create(OpCodes.Ret));
+                                    jump_to_end.Operand = weaver.Add(Instruction.Create(OpCodes.Ldnull)); //TODO: support value types
+                                    weaver.Add(Instruction.Create(OpCodes.Ret));
+                                }
 
                                 // Handled
                                 return;
@@ -418,20 +789,32 @@ namespace OxidePatcher.Hooks
                         }
                         else if (retvalue == "ret" || retvalue == "return")
                         {
-                            // Create variable
-                            VariableDefinition returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
+                            if (ret_var == null)
+                            {
+                                // Create variable
+                                VariableDefinition returnvar = weaver.AddVariable(method.Module.TypeSystem.Object, "returnvar");
 
-                            // Store the return value in it
-                            weaver.Stloc(returnvar);
-                            weaver.Ldloc(returnvar);
+                                // Store the return value in it
+                                weaver.Stloc(returnvar);
+                                
+                                weaver.Ldloc(returnvar);
 
-                            // If it's non-null and matches the return type, return it - else continue
-                            weaver.Add(Instruction.Create(OpCodes.Isinst, method.ReturnType));
-                            Instruction i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
-                            weaver.Add(Instruction.Create(OpCodes.Beq_S, i.Next));
-                            weaver.Ldloc(returnvar);
-                            weaver.Add(Instruction.Create(OpCodes.Unbox_Any, method.ReturnType));
-                            weaver.Add(Instruction.Create(OpCodes.Ret));
+                                // If it's non-null and matches the return type, return it - else continue
+                                weaver.Add(Instruction.Create(OpCodes.Isinst, method.ReturnType));
+                                Instruction i = weaver.Add(Instruction.Create(OpCodes.Ldnull));
+                                weaver.Add(Instruction.Create(OpCodes.Beq_S, i.Next));
+                                weaver.Ldloc(returnvar);
+                                weaver.Add(Instruction.Create(OpCodes.Unbox_Any, method.ReturnType));
+                                weaver.Add(Instruction.Create(OpCodes.Ret));
+                            }
+                            else
+                            {
+                                var jump_to_end = weaver.Add(Instruction.Create(OpCodes.Brfalse, weaver.Instructions[0]));
+                                weaver.Ldloc(ret_var);
+                                weaver.Add(Instruction.Create(OpCodes.Ret));
+                                jump_to_end.Operand = weaver.Add(Instruction.Create(OpCodes.Ldnull)); //TODO: support value types
+                                weaver.Add(Instruction.Create(OpCodes.Ret));
+                            }
 
                             // Handled
                             return;
@@ -466,7 +849,7 @@ namespace OxidePatcher.Hooks
             }
 
             // Split by comma
-            string[] args = leftright[0].Split(',');
+            string[] args = leftright[0].Split(',').Select(arg => arg.ToLowerInvariant()).ToArray();
 
             // Set the return value
             if (leftright.Length > 1)
@@ -478,7 +861,19 @@ namespace OxidePatcher.Hooks
             return args;
         }
 
-        private bool GetFieldOrProperty(ILWeaver weaver, MethodDefinition originalMethod, TypeDefinition currentArg, string[] target, Patcher patcher)
+        private string[] ParseTargetString(ref string arg)
+        {
+            var target = new string[0];
+            if (!string.IsNullOrEmpty(arg) && arg.Contains("."))
+            {
+                string[] split = arg.Split('.');
+                arg = split[0];
+                target = split.Skip(1).ToArray();
+            }
+            return target;
+        }
+        
+        private TypeDefinition GetFieldOrProperty(ILWeaver weaver, MethodDefinition originalMethod, TypeDefinition currentArg, string[] target, Patcher patcher, bool boxed = true)
         {
             if (resolver == null)
             {
@@ -486,7 +881,7 @@ namespace OxidePatcher.Hooks
                 resolver.AddSearchDirectory(patcher != null ? patcher.PatchProject.TargetDirectory : PatcherForm.MainForm.CurrentProject.TargetDirectory);
             }
 
-            if (currentArg == null || target == null || target.Length == 0) return false;
+            if (currentArg == null || target == null || target.Length == 0) return null;
 
             int i;
             var arg = currentArg;
@@ -497,12 +892,14 @@ namespace OxidePatcher.Hooks
                 break;
             }
 
-            if (arg.IsValueType || arg.IsByReference)
-                weaver.Add(arg.Module == originalMethod.Module
-                    ? Instruction.Create(OpCodes.Box, arg.Resolve())
-                    : Instruction.Create(OpCodes.Box, originalMethod.Module.Import(arg.Resolve())));
+            if (boxed && (arg.IsValueType || arg.IsByReference))
+            {
+                var type_reference = arg.Module == originalMethod.Module ? arg.Resolve() : originalMethod.Module.Import(arg.Resolve());
+                weaver?.Add(Instruction.Create(OpCodes.Box, type_reference));
+            }
 
-            return i >= 1;
+            if (i >= 1) return arg;
+            return null;
         }
 
         private bool GetFieldOrProperty(ILWeaver weaver, MethodDefinition originalMethod, ref TypeDefinition currentArg, string target)
@@ -519,7 +916,7 @@ namespace OxidePatcher.Hooks
                         {
                             if (!string.Equals(field.Name, target, StringComparison.CurrentCultureIgnoreCase)) continue;
 
-                            weaver.Add(field.Module == originalMethod.Module
+                            weaver?.Add(field.Module == originalMethod.Module
                                 ? Instruction.Create(OpCodes.Ldfld, field)
                                 : Instruction.Create(OpCodes.Ldfld, originalMethod.Module.Import(field)));
                             currentArg = field.FieldType.Resolve();
@@ -535,7 +932,7 @@ namespace OxidePatcher.Hooks
                     {
                         if (!string.Equals(property.Name, target, StringComparison.CurrentCultureIgnoreCase)) continue;
 
-                        weaver.Add(property.GetMethod.Module == originalMethod.Module
+                        weaver?.Add(property.GetMethod.Module == originalMethod.Module
                             ? Instruction.Create(OpCodes.Callvirt, property.GetMethod)
                             : Instruction.Create(OpCodes.Callvirt, originalMethod.Module.Import(property.GetMethod)));
                         currentArg = property.PropertyType.Resolve();

@@ -109,6 +109,7 @@ namespace OxidePatcher.Patching
             UpdateInstructions();
             Variables = new List<VariableDefinition>(body.Variables);
             Pointer = Instructions.Count - 1;
+            if (Pointer < 0) Pointer = 0;
         }
 
         /// <summary>
@@ -120,6 +121,7 @@ namespace OxidePatcher.Patching
             Instructions = new List<Instruction>(instructions);
             Variables = new List<VariableDefinition>(variables);
             Pointer = Instructions.Count - 1;
+            if (Pointer < 0) Pointer = 0;
         }
 
         /// <summary>
@@ -284,7 +286,7 @@ namespace OxidePatcher.Patching
             if (n == 6) return Instruction.Create(OpCodes.Ldc_I4_6);
             if (n == 7) return Instruction.Create(OpCodes.Ldc_I4_7);
             if (n == 8) return Instruction.Create(OpCodes.Ldc_I4_8);
-            return Instruction.Create(OpCodes.Ldc_I4_S, n);
+            return Instruction.Create(OpCodes.Ldc_I4_S, (sbyte)n);
         }
 
         public static Instruction Stloc_n(int n)
